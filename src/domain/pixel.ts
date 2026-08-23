@@ -20,6 +20,12 @@ function median(values: number[]): number {
   return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
 }
 
+function quantile(values: number[], q: number): number {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[clamp(Math.floor(q * (sorted.length - 1)), 0, sorted.length - 1)];
+}
+
 function luminance(raster: Raster, x: number, y: number): number {
   const p = at(raster, clamp(Math.floor(x), 0, raster.width - 1), clamp(Math.floor(y), 0, raster.height - 1));
   return raster.data[p] * 0.299 + raster.data[p + 1] * 0.587 + raster.data[p + 2] * 0.114;
@@ -51,8 +57,10 @@ export function normalizeRoi(raster: Raster, roi?: Roi | null): Roi {
   return { x, y, width: right - x, height: bottom - y };
 }
 
-// 沿某个轴对 ROI 做“暗度投影”。用中位数而不是平均值：
-// 格线贯穿整张图纸（中位数会被抬高），而编号文字和豆子填色只覆盖部分行/列。
+// 沿某个轴对 ROI 做“梯度能量投影”：Sobel 式亮度差分 + 0.8 分位数。
+// 不用暗度中位数：格线、编号文字、色块边缘、虚线都是同周期的合法证据，
+// 应该全部保留（网格越淡，编号文字越有价值）。0.8 分位数在“只留贯穿全图的
+// 格线”（中位数）和“被大块色块淹没”（平均值）之间取折中。
 function projection(raster: Raster, roi: Roi, axis: "x" | "y"): number[] {
   const length = axis === "x" ? roi.width : roi.height;
   const cross = axis === "x" ? roi.height : roi.width;
@@ -64,9 +72,13 @@ function projection(raster: Raster, roi: Roi, axis: "x" | "y"): number[] {
     for (let other = 0; other < cross; other += step) {
       const x = axis === "x" ? roi.x + position : roi.x + other;
       const y = axis === "x" ? roi.y + other : roi.y + position;
-      samples.push(255 - luminance(raster, x, y));
+      // x 轴信号关心竖向结构（水平方向亮度差），y 轴反之。
+      const gradient = axis === "x"
+        ? Math.abs(luminance(raster, x + 1, y) - luminance(raster, x - 1, y))
+        : Math.abs(luminance(raster, x, y + 1) - luminance(raster, x, y - 1));
+      samples.push(gradient);
     }
-    values[position] = median(samples);
+    values[position] = quantile(samples, 0.8);
   }
   return values;
 }
@@ -97,61 +109,120 @@ function correlation(residual: readonly number[], lag: number): number {
   return cross / Math.max(1, Math.sqrt(left * right));
 }
 
-// 整数自相关找出候选周期，再在 ±1.5px 内做 0.05px 步长的亚像素细化。
-// 21 px 与 21.4 px 在 49 列上差近 20 px，整数周期会让格线漂进格子中心。
+// 自相关 + 谐波峰列拟合。不判断“哪个峰是基频”，而是找一个 p 让最多的峰
+// 落在 n×p 上，再用全部峰做最小二乘 p = Σn·d / Σn²。
+// 亚像素精度来自多个倍频共同回归，不再需要 ±1.5px / 0.05 步长的暴力细化。
+// 候选 p 必须满足“1p 处本身有峰”，因此不会锁到 p/2；而 2p 候选会丢掉
+// 一半峰（p、3p… 不再是整数倍），证据多的 p 自然胜出。
 function findPitch(values: readonly number[]): { pitch: number; score: number } {
   const residual = detrend(values);
   const maxLag = Math.min(64, Math.floor(values.length / 4));
   if (maxLag < 8) return { pitch: Math.max(4, maxLag) || 18, score: 0 };
-  let bestScore = -Infinity;
-  const scores: Array<{ lag: number; score: number }> = [];
-  for (let lag = 8; lag <= maxLag; lag += 1) {
-    const score = correlation(residual, lag);
-    scores.push({ lag, score });
-    if (score > bestScore) bestScore = score;
+  const curve: number[] = [];
+  for (let lag = 8; lag <= maxLag; lag += 1) curve.push(correlation(residual, lag));
+  // 局部峰，三点抛物线插值出亚像素峰位。
+  const peaks: Array<{ lag: number; score: number }> = [];
+  for (let i = 1; i < curve.length - 1; i += 1) {
+    if (curve[i] <= 0 || curve[i] <= curve[i - 1] || curve[i] < curve[i + 1]) continue;
+    const denominator = curve[i - 1] - 2 * curve[i] + curve[i + 1];
+    const delta = denominator ? clamp(0.5 * (curve[i - 1] - curve[i + 1]) / denominator, -0.5, 0.5) : 0;
+    peaks.push({ lag: i + 8 + delta, score: curve[i] });
   }
-  // 周期翻倍（2p）的自相关经常比基频还高，不能全局取最大。
-  // 基频处一定存在局部极大值，所以取“得分不低于最强局部峰一半”的最小局部极大值。
-  const localMaxima = scores.filter((item, index) => {
-    const before = scores[index - 1]?.score ?? -Infinity;
-    const after = scores[index + 1]?.score ?? -Infinity;
-    return item.score > before && item.score >= after && item.score > 0;
-  });
-  const strongest = Math.max(0, ...localMaxima.map((item) => item.score));
-  const chosen = (localMaxima.filter((item) => item.score >= strongest * 0.5).sort((a, b) => a.lag - b.lag)[0] ?? scores.find((item) => item.score === bestScore))?.lag ?? 18;
-  let refined = chosen;
-  let refinedScore = -Infinity;
-  for (let lag = Math.max(6, chosen - 1.5); lag <= chosen + 1.5; lag += 0.05) {
-    const score = correlation(residual, lag);
-    if (score > refinedScore) { refinedScore = score; refined = lag; }
+  if (!peaks.length) return { pitch: 18, score: 0 };
+  // 格线↔文字的交叉项会在 p/2 处产生弱峰（幅值通常不到真实谐波的 1/10），
+  // 不过滤的话候选 p/2 会靠“峰多”在求和权重上险胜真正的 p。
+  const strongest = Math.max(...peaks.map((peak) => peak.score));
+  const significant = peaks.filter((peak) => peak.score >= strongest * 0.25);
+  let best: { pitch: number; score: number; inliers: Array<{ n: number; lag: number; score: number }> } | null = null;
+  for (let p = 8; p <= maxLag; p += 0.1) {
+    const tolerance = Math.max(0.8, p * 0.06);
+    let hasBase = false;
+    let weight = 0;
+    const inliers: Array<{ n: number; lag: number; score: number }> = [];
+    for (const peak of significant) {
+      const n = Math.round(peak.lag / p);
+      if (n < 1 || Math.abs(peak.lag - n * p) > tolerance) continue;
+      // 1p 基频峰必须足够强：格内若存在每格重复 3 次的结构（如多笔画编号），
+      // 会产生 p/3 间隔的密集峰列，否则候选 2p/3 会靠“峰多”累计权重险胜真周期。
+      if (n === 1) {
+        if (peak.score < strongest * 0.4) continue;
+        hasBase = true;
+      }
+      weight += peak.score;
+      inliers.push({ n, lag: peak.lag, score: peak.score });
+    }
+    if (!hasBase) continue;
+    if (!best || weight > best.score) best = { pitch: p, score: weight, inliers };
   }
-  return { pitch: refined, score: refinedScore };
+  if (!best) return { pitch: significant[0].lag, score: 0 };
+  // 最小二乘细化：d_n ≈ n·p → p = Σ(n·d) / Σ(n²)
+  let sumND = 0;
+  let sumNN = 0;
+  for (const inlier of best.inliers) {
+    sumND += inlier.n * inlier.lag;
+    sumNN += inlier.n * inlier.n;
+  }
+  const pitch = sumNN ? sumND / sumNN : best.pitch;
+  const confidence = clamp(best.score / best.inliers.length, 0, 1);
+  return { pitch, score: confidence };
 }
 
-// 相位由格线决定而不是图案内容：候选相位下格线能量要高，穿过格子中心的暗线能量要低。
+// comb 搜索：相位只需在 [0, pitch) 内找，让梳齿尽量压在梯度能量高的位置
+// （格线/色块边界）。格心不再做惩罚项——编号文字本身就在格心产生梯度，
+// 惩罚它会抵消文字这条证据。格线 vs 格心的 p/2 歧义交给格内一致性裁决。
 function findPhase(proj: readonly number[], pitch: number): number {
   let bestOffset = 0;
   let bestScore = -Infinity;
   for (let offset = 0; offset < pitch; offset += 0.25) {
     let border = 0;
     let borderCount = 0;
-    let center = 0;
-    let centerCount = 0;
     for (let k = 0; ; k += 1) {
       const line = offset + k * pitch;
       if (line >= proj.length) break;
       border += interp(proj, line);
       borderCount += 1;
-      const middle = line + pitch / 2;
-      if (middle < proj.length) {
-        center += interp(proj, middle);
-        centerCount += 1;
-      }
     }
-    const score = border / Math.max(1, borderCount) - 0.5 * (center / Math.max(1, centerCount));
+    const score = border / Math.max(1, borderCount);
     if (score > bestScore) { bestScore = score; bestOffset = offset; }
   }
   return bestOffset;
+}
+
+// 格内一致性：正确相位下每个格子的四角区域（避开格线与中心编号）应接近单色。
+// 相位错半格时四角会横跨两个豆子，方差明显变大。返回归一化后的平均方差。
+function cellUniformity(raster: Raster, geometry: GridGeometry, rows: number, columns: number): number {
+  const stride = Math.max(1, Math.ceil((rows * columns) / 400));
+  let total = 0;
+  let counted = 0;
+  for (let index = 0; index < rows * columns; index += stride) {
+    const row = Math.floor(index / columns);
+    const column = index % columns;
+    const left = geometry.originX + column * geometry.cellWidth;
+    const top = geometry.originY + row * geometry.cellHeight;
+    const width = geometry.cellWidth;
+    const height = geometry.cellHeight;
+    const colors: Array<[number, number, number]> = [];
+    const collect = (x0: number, y0: number, x1: number, y1: number) => {
+      for (let y = clamp(Math.ceil(y0), 0, raster.height - 1); y <= clamp(Math.floor(y1), 0, raster.height - 1); y += 1) {
+        for (let x = clamp(Math.ceil(x0), 0, raster.width - 1); x <= clamp(Math.floor(x1), 0, raster.width - 1); x += 1) {
+          colors.push(rgbAt(raster, x, y));
+        }
+      }
+    };
+    collect(left + width * 0.14, top + height * 0.14, left + width * 0.34, top + height * 0.34);
+    collect(left + width * 0.66, top + height * 0.14, left + width * 0.86, top + height * 0.34);
+    collect(left + width * 0.14, top + height * 0.66, left + width * 0.34, top + height * 0.86);
+    collect(left + width * 0.66, top + height * 0.66, left + width * 0.86, top + height * 0.86);
+    if (colors.length < 4) continue;
+    const mean = [0, 0, 0];
+    for (const color of colors) { mean[0] += color[0]; mean[1] += color[1]; mean[2] += color[2]; }
+    mean[0] /= colors.length; mean[1] /= colors.length; mean[2] /= colors.length;
+    let variance = 0;
+    for (const color of colors) variance += (color[0] - mean[0]) ** 2 + (color[1] - mean[1]) ** 2 + (color[2] - mean[2]) ** 2;
+    total += variance / colors.length;
+    counted += 1;
+  }
+  return counted ? total / counted : Infinity;
 }
 
 interface CellInk { score: number; base: [number, number, number]; }
@@ -275,17 +346,46 @@ function trimAnalysis(geometry: GridGeometry, rows: number, columns: number, ana
   };
 }
 
-// 完整自动流程：ROI 内投影 → 亚像素周期 → 格线能量定相位 → inkRatio + Otsu → 裁剪到有效格外接框。
+// 完整自动流程：ROI 内梯度投影 → 谐波拟合亚像素周期 → X/Y 联合校正倍频
+// → comb 搜索相位 → 格内一致性裁决 p/2 歧义 → inkRatio + Otsu → 裁剪到有效格外接框。
 export function detectGrid(raster: Raster, roi?: Roi | null): GridDetection {
   const region = normalizeRoi(raster, roi);
   const projectionX = projection(raster, region, "x");
   const projectionY = projection(raster, region, "y");
   const pitchX = findPitch(projectionX);
   const pitchY = findPitch(projectionY);
-  const originX = region.x + findPhase(projectionX, pitchX.pitch);
-  const originY = region.y + findPhase(projectionY, pitchY.pitch);
-  const columns = Math.max(1, Math.round((region.x + region.width - originX) / pitchX.pitch));
-  const rows = Math.max(1, Math.round((region.y + region.height - originY) / pitchY.pitch));
+  // 拼豆格近似正方形：两边周期相差整数倍时，几乎必有一边锁到了倍频，
+  // 把大的一边除回来（谐波拟合要求 1p 处有峰，小的一边更可信）。
+  const ratio = pitchX.pitch / pitchY.pitch;
+  const multiple = Math.round(ratio);
+  if (multiple >= 2 && Math.abs(ratio - multiple) < 0.12) {
+    if (pitchX.pitch > pitchY.pitch) pitchX.pitch /= multiple;
+    else pitchY.pitch /= multiple;
+  }
+  let originX = region.x + findPhase(projectionX, pitchX.pitch);
+  let originY = region.y + findPhase(projectionY, pitchY.pitch);
+  // 行列数按“格心落在 ROI 内”计数：comb 锁到的相位可能偏到格线边缘
+  // （梯度投影里一条格线有两个边缘峰），用 round((size-origin)/pitch) 会在
+  // ROI 边缘丢掉一整行/列。先按格心归属算出首格索引，再反推原点。
+  const lattice = (offset: number, size: number, pitch: number) => {
+    const kMin = Math.ceil((0 - offset) / pitch - 0.5);
+    const kMax = Math.floor((size - offset) / pitch - 0.5);
+    return { start: offset + kMin * pitch, count: Math.max(1, kMax - kMin + 1) };
+  };
+  const latticeX = lattice(originX - region.x, region.width, pitchX.pitch);
+  const latticeY = lattice(originY - region.y, region.height, pitchY.pitch);
+  originX = region.x + latticeX.start;
+  originY = region.y + latticeY.start;
+  const columns = latticeX.count;
+  const rows = latticeY.count;
+  // 编号文字中心同样是 p 周期，comb 可能锁到格心。比较 φ 与 φ+p/2 两种
+  // 切法的格内四角颜色方差，更均匀的才是真实格线。
+  const candidate: GridGeometry = { originX, originY, cellWidth: pitchX.pitch, cellHeight: pitchY.pitch };
+  const shifted: GridGeometry = { ...candidate, originX: originX + pitchX.pitch / 2, originY: originY + pitchY.pitch / 2 };
+  if (cellUniformity(raster, shifted, rows, columns) < cellUniformity(raster, candidate, rows, columns)) {
+    originX = shifted.originX;
+    originY = shifted.originY;
+  }
   const geometry: GridGeometry = { originX, originY, cellWidth: pitchX.pitch, cellHeight: pitchY.pitch };
   const trimmed = trimAnalysis(geometry, rows, columns, analyzeOccupancy(raster, geometry, rows, columns));
   return {
