@@ -18,6 +18,7 @@ npm run dev
 ```bash
 npm test
 npm run build
+npm run dev
 ```
 
 推送到 `main` 或 `master` 后，`.github/workflows/pages.yml` 会构建并发布 GitHub Pages。仓库设置中需要将 Pages Source 设为 GitHub Actions。

@@ -188,7 +188,7 @@ function GridCanvas({ raster, grid, selectedCell, alignMode, onCellClick, onAlig
 
 function PixelPreview({ matrix, onCellClick, showGrid = true, labels }: { matrix: PixelMatrix; onCellClick?: (index: number) => void; showGrid?: boolean; labels?: string[] }) {
   return (
-    <div className={`pixel-preview ${showGrid ? "show-grid" : ""}`} style={{ "--columns": matrix.columns } as React.CSSProperties}>
+    <div className={`pixel-preview ${showGrid ? "show-grid" : ""}`} style={{ "--columns": matrix.columns, "--rows": matrix.rows } as React.CSSProperties}>
       {matrix.cells.map((cell, index) => (
         <button
           type="button"
@@ -224,6 +224,8 @@ export function App() {
   const [tool, setTool] = useState<Tool>("paint");
   const [paintColor, setPaintColor] = useState("#164e63");
   const [showGrid, setShowGrid] = useState(true);
+  const [exportScale, setExportScale] = useState(1);
+  const [maxColors, setMaxColors] = useState(10);
   const [error, setError] = useState("");
 
   // 网格几何一旦变化就重新计算每格 inkRatio；几何变化同时清空人工修正。
@@ -256,22 +258,24 @@ export function App() {
 
   const occupancyPreview = useMemo<PixelMatrix | null>(() => {
     if (!grid || !analysis) return null;
-    // 分数落在阈值 ±30% 的格子标记为“不确定”，用橙色提示人工检查。
+    // 分数落在阈值 ±30% 的格子标记为“不确定”，用橙色提示人工检查；
+    // 人工点击过的格子视为已确认，直接显示切换后的状态色。
     const band = Math.max(0.004, effectiveThreshold * 0.3);
     return {
       rows: grid.rows,
       columns: grid.columns,
       background: [255, 255, 255],
       cells: analysis.scores.map((score, index) => {
-        const uncertain = Math.abs(score - effectiveThreshold) <= band;
         const occupied = occupancy[index];
+        const manual = Object.prototype.hasOwnProperty.call(flips, index);
+        const uncertain = !manual && Math.abs(score - effectiveThreshold) <= band;
         return {
           color: uncertain ? [217, 119, 6] as [number, number, number] : occupied ? [20, 93, 89] as [number, number, number] : null,
           confidence: score,
         };
       }),
     };
-  }, [grid, analysis, occupancy, effectiveThreshold]);
+  }, [grid, analysis, occupancy, effectiveThreshold, flips]);
 
   async function loadFile(file: File) {
     setError("");
@@ -347,7 +351,7 @@ export function App() {
 
   function recognize() {
     if (!raster || !grid) return;
-    const nextMatrix = recognizeMatrix(raster, { rows: grid.rows, columns: grid.columns, geometry: grid.geometry, occupancy });
+    const nextMatrix = recognizeMatrix(raster, { rows: grid.rows, columns: grid.columns, geometry: grid.geometry, occupancy }, 0, maxColors);
     setMatrix(nextMatrix);
     setHistory([]);
     setFuture([]);
@@ -397,10 +401,19 @@ export function App() {
 
   function exportPng() {
     if (!matrix) return;
+    const scale = Math.max(1, Math.min(50, Math.round(exportScale) || 1));
     const canvas = document.createElement("canvas");
-    canvas.width = matrix.columns;
-    canvas.height = matrix.rows;
-    canvas.getContext("2d")?.putImageData(renderMatrix(matrix), 0, 0);
+    canvas.width = matrix.columns * scale;
+    canvas.height = matrix.rows * scale;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    // 先渲染 1 像素/格的矩阵，再关闭平滑最近邻放大，保证色块边缘锐利、透明区域不被污染。
+    const source = document.createElement("canvas");
+    source.width = matrix.columns;
+    source.height = matrix.rows;
+    source.getContext("2d")?.putImageData(renderMatrix(matrix), 0, 0);
+    context.imageSmoothingEnabled = false;
+    context.drawImage(source, 0, 0, canvas.width, canvas.height);
     canvas.toBlob((blob) => {
       if (!blob) return;
       const link = document.createElement("a");
@@ -413,6 +426,7 @@ export function App() {
 
   const confidence = grid ? Math.round(grid.confidence * 100) : 0;
   const occupiedCount = occupancy.filter(Boolean).length;
+  const safeExportScale = Math.max(1, Math.min(50, Math.round(exportScale) || 1));
   const stepIndex = STEP_ORDER.indexOf(step);
 
   return (
@@ -462,7 +476,7 @@ export function App() {
               <div><p className="eyebrow">OCCUPANCY</p><h3>确认识别结果</h3></div>
               <span className="metric">网格置信度 {confidence}%</span>
             </div>
-            <p className="muted">绿色是有豆格，棋盘格是空位，橙色是分数接近阈值的“不确定”格。点击矩阵可逐格切换；打开“显示分数”可查看每格墨迹比例。</p>
+            <p className="hint-strong">绿色是有豆格，棋盘格是空位，橙色是分数接近阈值的“不确定”格。<strong>点击矩阵中的任意格子可逐格切换有豆/空位</strong>（橙色格点一下即可确认或排除）；打开“显示分数”可查看每格墨迹比例。</p>
             <div className="binary-stage">
               <PixelPreview matrix={occupancyPreview} onCellClick={toggleOccupancy} labels={showScores ? analysis.scores.map((score) => score.toFixed(2)) : undefined} />
             </div>
@@ -486,6 +500,10 @@ export function App() {
               <Field label="格宽" value={grid.geometry.cellWidth} min={2} step={0.1} onChange={(value) => updateGeometry({ cellWidth: value })} />
               <Field label="格高" value={grid.geometry.cellHeight} min={2} step={0.1} onChange={(value) => updateGeometry({ cellHeight: value })} />
             </div>
+            <div className="form-grid">
+              <Field label="颜色上限" value={maxColors} min={1} max={64} onChange={(value) => setMaxColors(Math.max(1, Math.min(64, Math.round(value) || 1)))} />
+            </div>
+            <p className="muted">拼豆色号通常很少：填充颜色时，相近的采样色会自动合并，最终颜色不会超过这个数量。</p>
             <label className="field threshold-field">
               <span>占位阈值（墨迹比例 &gt; {effectiveThreshold.toFixed(3)} 判为有豆，自动值由 Otsu 给出）</span>
               <input type="range" min={0} max={maxScore} step={maxScore / 200} value={effectiveThreshold} onChange={(event) => setThreshold(Number(event.target.value))} />
@@ -531,6 +549,10 @@ export function App() {
             <div className="history-buttons">
               <button type="button" className="button secondary" disabled={!history.length} onClick={undo}>撤销</button>
               <button type="button" className="button secondary" disabled={!future.length} onClick={redo}>重做</button>
+            </div>
+            <div className="export-size">
+              <Field label="每格像素" value={exportScale} min={1} max={50} onChange={(value) => setExportScale(Math.max(1, Math.min(50, Math.round(value) || 1)))} />
+              <span className="muted">导出尺寸 {matrix.columns * safeExportScale} × {matrix.rows * safeExportScale} px</span>
             </div>
             <button type="button" className="button primary full" onClick={exportPng}>下载透明 PNG</button>
           </aside>
