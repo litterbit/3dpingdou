@@ -7,6 +7,7 @@ import {
   fullRoi,
   recognizeMatrix,
   renderMatrix,
+  floatingBlockOffsets,
   type GridGeometry,
   type PixelCell,
   type PixelMatrix,
@@ -224,8 +225,9 @@ export function App() {
   const [tool, setTool] = useState<Tool>("paint");
   const [paintColor, setPaintColor] = useState("#164e63");
   const [showGrid, setShowGrid] = useState(true);
-  const [exportScale, setExportScale] = useState(1);
-  const [maxColors, setMaxColors] = useState(10);
+  const [exportScale, setExportScale] = useState(10);
+  const [maxColors, setMaxColors] = useState(16);
+  const [overlapPx, setOverlapPx] = useState(2);
   const [error, setError] = useState("");
 
   // 网格几何一旦变化就重新计算每格 inkRatio；几何变化同时清空人工修正。
@@ -402,18 +404,13 @@ export function App() {
   function exportPng() {
     if (!matrix) return;
     const scale = Math.max(1, Math.min(50, Math.round(exportScale) || 1));
+    const fix = floatingBlockOffsets(matrix);
     const canvas = document.createElement("canvas");
-    canvas.width = matrix.columns * scale;
-    canvas.height = matrix.rows * scale;
-    const context = canvas.getContext("2d");
-    if (!context) return;
-    // 先渲染 1 像素/格的矩阵，再关闭平滑最近邻放大，保证色块边缘锐利、透明区域不被污染。
-    const source = document.createElement("canvas");
-    source.width = matrix.columns;
-    source.height = matrix.rows;
-    source.getContext("2d")?.putImageData(renderMatrix(matrix), 0, 0);
-    context.imageSmoothingEnabled = false;
-    context.drawImage(source, 0, 0, canvas.width, canvas.height);
+    // 逐格按 scale×scale 实心矩形绘制；仅靠角相连的悬空块朝主体偏移 overlapPx，与主体产生小重叠。
+    const image = renderMatrix(matrix, { scale, offsetPx: overlapPx, offsets: fix.offsets });
+    canvas.width = image.width;
+    canvas.height = image.height;
+    canvas.getContext("2d")?.putImageData(image, 0, 0);
     canvas.toBlob((blob) => {
       if (!blob) return;
       const link = document.createElement("a");
@@ -427,6 +424,8 @@ export function App() {
   const confidence = grid ? Math.round(grid.confidence * 100) : 0;
   const occupiedCount = occupancy.filter(Boolean).length;
   const safeExportScale = Math.max(1, Math.min(50, Math.round(exportScale) || 1));
+  const safeOverlap = Math.max(0, Math.min(safeExportScale, Math.round(overlapPx) || 0));
+  const cornerFix = useMemo(() => (matrix ? floatingBlockOffsets(matrix) : null), [matrix]);
   const stepIndex = STEP_ORDER.indexOf(step);
 
   return (
@@ -552,7 +551,10 @@ export function App() {
             </div>
             <div className="export-size">
               <Field label="每格像素" value={exportScale} min={1} max={50} onChange={(value) => setExportScale(Math.max(1, Math.min(50, Math.round(value) || 1)))} />
-              <span className="muted">导出尺寸 {matrix.columns * safeExportScale} × {matrix.rows * safeExportScale} px</span>
+              <Field label="悬空块偏移（像素）" value={overlapPx} min={0} max={safeExportScale} onChange={(value) => setOverlapPx(Math.max(0, Math.min(safeExportScale, Math.round(value) || 0)))} />
+              <span className="muted">导出尺寸 {matrix.columns * safeExportScale + safeOverlap * 2} × {matrix.rows * safeExportScale + safeOverlap * 2} px</span>
+              {cornerFix && cornerFix.fixed > 0 && <span className="muted">{cornerFix.fixed} 个仅靠角相连的色块，导出时会朝主体偏移 {safeOverlap} px 产生重叠，打印后即粘在主体上。</span>}
+              {cornerFix && cornerFix.stranded > 0 && <span className="muted">{cornerFix.stranded} 个色块与主体完全分离（连角都不挨着），无法自动粘连，请先用画笔补连。</span>}
             </div>
             <button type="button" className="button primary full" onClick={exportPng}>下载透明 PNG</button>
           </aside>
