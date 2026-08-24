@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { detectGrid, recognizeMatrix, renderMatrix } from "../src/domain/pixel";
-import { makeNumberedGridFixture } from "../Lumina-Fuse-Bead-Studio/test/helpers/beadFixtures";
-import { makeGuidedNumberedChart } from "../Lumina-Fuse-Bead-Studio/test/helpers/chartFixtures";
+import { makeNumberedGridFixture } from "./helpers/beadFixtures";
+import { makeGuidedNumberedChart } from "./helpers/chartFixtures";
 
 describe("numbered bead chart recognition", () => {
   it("uses the full numbered-cell pitch instead of a smaller color period", () => {
