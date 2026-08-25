@@ -4,6 +4,12 @@ import type { GridGeometry, OccupancyAnalysis, Raster } from "./types";
 // 中心像素与格子底色的颜色距离超过该值就视为“墨迹”（编号/符号）。
 const INK_DISTANCE = 36;
 
+// 强墨迹阈值与最低占比：图纸水印是浅灰（与纸面距离 <60），而编号文字无论深浅，
+// 笔画核心与底色的距离都 >60（实测有豆格强墨迹占比 ≥0.08，水印格恒为 0）。
+// 只有弱墨迹、几乎没有强墨迹的格子按水印/污渍处理，直接清零，不参与 Otsu。
+const STRONG_INK_DISTANCE = 60;
+const STRONG_MIN = 0.02;
+
 // 找“贯穿线”行/列：虚线/实线横穿格子时会形成一小段填充率 ≈1 的连续行（列），
 // 且带外几乎为空。编号文字也可能整行填满窗口（窄窗口里文字横向占满），但文字
 // 实心块通常 ≥4 个满行且相邻行填充较高，所以剔除按带长分级（见函数内注释）。
@@ -70,20 +76,24 @@ function cellInk(raster: Raster, left: number, top: number, right: number, botto
   const cols = x1 - x0 + 1;
   if (rows <= 0 || cols <= 0) return { score: 0, base };
   const inkMask = new Array<boolean>(rows * cols).fill(false);
+  const strongMask = new Array<boolean>(rows * cols).fill(false);
   const rowFill = new Array<number>(rows).fill(0);
   const colFill = new Array<number>(cols).fill(0);
   for (let y = y0; y <= y1; y += 1) {
     for (let x = x0; x <= x1; x += 1) {
-      if (distance(rgbAt(raster, x, y), base) > INK_DISTANCE) {
+      const d = distance(rgbAt(raster, x, y), base);
+      if (d > INK_DISTANCE) {
         inkMask[(y - y0) * cols + (x - x0)] = true;
         rowFill[y - y0] += 1;
         colFill[x - x0] += 1;
+        if (d > STRONG_INK_DISTANCE) strongMask[(y - y0) * cols + (x - x0)] = true;
       }
     }
   }
   const rowExcluded = lineBands(rowFill.map((count) => count / cols));
   const colExcluded = lineBands(colFill.map((count) => count / rows));
   let ink = 0;
+  let strong = 0;
   let total = 0;
   // 剩余墨迹的外接框，用于识别“局部线头”：虚线端点落在窗口内时只剩几列宽，
   // 够不到整行 95% 填充的剔除条件，但形状仍是细长实心条（长宽比大、矩形填充率高）。
@@ -102,6 +112,7 @@ function cellInk(raster: Raster, left: number, top: number, right: number, botto
         if (dx > inkMaxX) inkMaxX = dx;
         if (dy < inkMinY) inkMinY = dy;
         if (dy > inkMaxY) inkMaxY = dy;
+        if (strongMask[dy * cols + dx]) strong += 1;
       }
     }
   }
@@ -110,9 +121,14 @@ function cellInk(raster: Raster, left: number, top: number, right: number, botto
     const spanY = inkMaxY - inkMinY + 1;
     const aspect = Math.max(spanX, spanY) / Math.min(spanX, spanY);
     const boxFill = ink / (spanX * spanY);
-    // 文字笔画是带孔洞的紧凑块（填充率 <0.5、长宽比 <2），线头是细长实心条。
-    if (aspect >= 2.2 && boxFill >= 0.55) ink = 0;
+    //  veto 只针对“细”长实心条（线头一个方向只有 1-2px 粗）；
+    // 低对比度编号（如红底暗红字 F19）只有笔画核心超过阈值，墨迹块紧实饱满，
+    // 两个方向都有 4-5px，长宽比也会 >2.2，不能按线头误杀。
+    const thin = Math.min(spanX, spanY) <= Math.max(2, Math.min(rows, cols) * 0.2);
+    if (thin && aspect >= 2.2 && boxFill >= 0.55) ink = 0;
   }
+  // 水印守卫：只有浅灰弱墨迹、没有深色笔画核心的格子不是编号，按空白处理。
+  if (total > 0 && strong / total < STRONG_MIN) ink = 0;
   return { score: total ? ink / total : 0, base };
 }
 
