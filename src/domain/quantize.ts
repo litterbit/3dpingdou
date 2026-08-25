@@ -3,7 +3,7 @@ import { colorKey, distance } from "./helpers";
 // ---------- 颜色量化：把相近的采样色合并成少数几个代表色 ----------
 
 // sRGB → CIE Lab（D65），用感知距离而不是 RGB 欧氏距离判断“相近”。
-function rgbToLab(color: readonly number[]): [number, number, number] {
+export function rgbToLab(color: readonly number[]): [number, number, number] {
   const linear = (value: number) => {
     const v = value / 255;
     return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;

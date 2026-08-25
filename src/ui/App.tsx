@@ -2,13 +2,17 @@ import { useEffect, useMemo, useState } from "react";
 import {
   analyzeOccupancy,
   applyThreshold,
+  classifyImage,
   colorKey,
   detectGrid,
+  detectPixelArt,
   fullRoi,
   recognizeMatrix,
   renderMatrix,
   floatingBlockOffsets,
+  samplePixelMatrix,
   type GridGeometry,
+  type ImageKind,
   type PixelCell,
   type PixelMatrix,
   type Raster,
@@ -19,13 +23,15 @@ import { CalibrateStep } from "./steps/CalibrateStep";
 import { CropStep } from "./steps/CropStep";
 import { EditStep } from "./steps/EditStep";
 import { UploadStep } from "./steps/UploadStep";
-import { STEP_LABELS, STEP_ORDER, titleFor, type GridState, type Step, type Tool } from "./types";
+import { STEP_LABELS, STEP_ORDER, titleFor, type GridState, type ModeSetting, type Step, type Tool } from "./types";
 
 export function App() {
   const [step, setStep] = useState<Step>("upload");
   const [raster, setRaster] = useState<Raster | null>(null);
   const [fileName, setFileName] = useState("拼豆图纸");
   const [roi, setRoi] = useState<Roi | null>(null);
+  const [modeSetting, setModeSetting] = useState<ModeSetting>("auto");
+  const [kind, setKind] = useState<ImageKind | null>(null);
   const [grid, setGrid] = useState<GridState | null>(null);
   const [threshold, setThreshold] = useState<number | null>(null);
   const [flips, setFlips] = useState<Record<number, boolean>>({});
@@ -44,9 +50,10 @@ export function App() {
   const [error, setError] = useState("");
 
   // 网格几何一旦变化就重新计算每格 inkRatio；几何变化同时清空人工修正。
+  // 像素图模式没有"墨迹占位"概念，跳过。
   const analysis = useMemo(
-    () => (raster && grid ? analyzeOccupancy(raster, grid.geometry, grid.rows, grid.columns) : null),
-    [raster, grid],
+    () => (raster && grid && kind !== "pixel" ? analyzeOccupancy(raster, grid.geometry, grid.rows, grid.columns) : null),
+    [raster, grid, kind],
   );
 
   useEffect(() => {
@@ -92,6 +99,12 @@ export function App() {
     };
   }, [grid, analysis, occupancy, effectiveThreshold, flips]);
 
+  // 像素图模式：直接按当前网格采样出彩色矩阵预览（含背景置空 + 量化）。
+  const pixelPreview = useMemo<PixelMatrix | null>(() => {
+    if (!raster || !grid || kind !== "pixel") return null;
+    return samplePixelMatrix(raster, grid.geometry, grid.rows, grid.columns, maxColors);
+  }, [raster, grid, kind, maxColors]);
+
   async function loadFile(file: File) {
     setError("");
     if (!file.type.startsWith("image/")) { setError("请选择 PNG、JPG 或 WebP 图片。"); return; }
@@ -104,6 +117,7 @@ export function App() {
       setRaster(nextRaster);
       setRoi(fullRoi(nextRaster));
       setGrid(null);
+      setKind(null);
       setMatrix(null);
       setFileName(file.name.replace(/\.[^.]+$/, "") || "拼豆图纸");
       setStep("crop");
@@ -114,8 +128,24 @@ export function App() {
 
   function runDetection(region: Roi) {
     if (!raster) return;
-    const detection = detectGrid(raster, region);
-    setGrid({ roi: detection.roi, rows: detection.rows, columns: detection.columns, geometry: detection.geometry, confidence: detection.confidence });
+    const resolved: ImageKind = modeSetting === "auto" ? classifyImage(raster, region) : modeSetting;
+    setKind(resolved);
+    if (resolved === "pixel") {
+      // 像素图：FFT/梯度估计格子数 → 网格线吸附 → 采样。roi 收紧到图案外接框，
+      // 让校准步骤的行/列数修改按图案范围均分。
+      const detection = detectPixelArt(raster, region, maxColors);
+      const { geometry, rows, columns } = detection;
+      setGrid({
+        roi: { x: geometry.originX, y: geometry.originY, width: columns * geometry.cellWidth, height: rows * geometry.cellHeight },
+        rows,
+        columns,
+        geometry,
+        confidence: detection.confidence,
+      });
+    } else {
+      const detection = detectGrid(raster, region);
+      setGrid({ roi: detection.roi, rows: detection.rows, columns: detection.columns, geometry: detection.geometry, confidence: detection.confidence });
+    }
     setAlignMode(false);
     setStep("calibrate");
   }
@@ -156,7 +186,10 @@ export function App() {
 
   function recognize() {
     if (!raster || !grid) return;
-    const nextMatrix = recognizeMatrix(raster, { rows: grid.rows, columns: grid.columns, geometry: grid.geometry, occupancy }, 0, maxColors);
+    // 像素图：按当前（可能被手调过的）网格直接重采样；图纸：按确认的占位识别。
+    const nextMatrix = kind === "pixel"
+      ? samplePixelMatrix(raster, grid.geometry, grid.rows, grid.columns, maxColors)
+      : recognizeMatrix(raster, { rows: grid.rows, columns: grid.columns, geometry: grid.geometry, occupancy }, 0, maxColors);
     setMatrix(nextMatrix);
     setHistory([]);
     setFuture([]);
@@ -168,6 +201,7 @@ export function App() {
     setRaster(null);
     setRoi(null);
     setGrid(null);
+    setKind(null);
     setMatrix(null);
     setError("");
   }
@@ -225,7 +259,9 @@ export function App() {
   }
 
   const confidence = grid ? Math.round(grid.confidence * 100) : 0;
-  const occupiedCount = occupancy.filter(Boolean).length;
+  const occupiedCount = kind === "pixel"
+    ? (pixelPreview ? pixelPreview.cells.filter((cell) => cell.color).length : 0)
+    : occupancy.filter(Boolean).length;
   const safeExportScale = Math.max(1, Math.min(50, Math.round(exportScale) || 1));
   const safeOverlap = Math.max(0, Math.min(safeExportScale, Math.round(overlapPx) || 0));
   const cornerFix = useMemo(() => (matrix ? floatingBlockOffsets(matrix) : null), [matrix]);
@@ -243,7 +279,7 @@ export function App() {
       </header>
 
       <section className="intro">
-        <div><p className="eyebrow">LOCAL · PRIVATE · PNG</p><h2>{titleFor(step)}</h2><p>框选带编号的拼豆图纸，校准网格后确认识别结果，导出适合 3D 打印的透明像素 PNG。</p></div>
+        <div><p className="eyebrow">LOCAL · PRIVATE · PNG</p><h2>{titleFor(step)}</h2><p>框选拼豆图纸或放大模糊的像素截图，校准网格后确认识别结果，导出适合 3D 打印的透明像素 PNG。</p></div>
         <div className="steps">{STEP_LABELS.map((label, index) => <span key={label} className={index === stepIndex ? "active" : index < stepIndex ? "done" : ""}>{label}</span>)}</div>
       </section>
 
@@ -255,18 +291,22 @@ export function App() {
         <CropStep
           raster={raster}
           roi={roi}
+          mode={modeSetting}
+          onModeChange={setModeSetting}
           onRoiChange={setRoi}
           onUseFullImage={() => setRoi(fullRoi(raster))}
           onConfirm={() => { if (roi) runDetection(roi); }}
         />
       )}
 
-      {step === "calibrate" && raster && grid && analysis && occupancyPreview && (
+      {step === "calibrate" && raster && grid && (kind === "pixel" ? pixelPreview : analysis && occupancyPreview) && (
         <CalibrateStep
           raster={raster}
           grid={grid}
+          kind={kind ?? "chart"}
           analysis={analysis}
           occupancyPreview={occupancyPreview}
+          pixelPreview={pixelPreview}
           confidence={confidence}
           occupiedCount={occupiedCount}
           showScores={showScores}

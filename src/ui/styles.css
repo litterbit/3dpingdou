@@ -34,3 +34,6 @@ h1, h2, h3, p { margin-top: 0; } h1 { margin-bottom: 0; font-size: 17px; letter-
 .matrix-caption .toggle { margin-left: 14px; }
 @media (max-width: 820px) { .app-shell { width: min(100% - 28px, 620px); } .topbar { min-height: 72px; } .topbar-actions .secondary:first-child { font-size: 0; padding: 10px; } .topbar-actions .secondary:first-child::before { content: "↑"; font-size: 17px; } .intro { display: block; padding: 44px 0 28px; } .steps { margin-top: 25px; } .calibrate-layout, .editor-layout { grid-template-columns: 1fr; } .tool-panel { position: static; } .matrix-stage { min-height: 320px; padding: 16px; } .feature-row { gap: 12px; justify-content: space-between; font-size: 10px; } }
 @media (max-width: 460px) { .app-shell { width: calc(100% - 20px); } h2 { font-size: 32px; } .topbar-actions .button.secondary:last-child { display: none; } .drop-target { min-height: 260px; margin: 10px; } .feature-row { flex-direction: column; align-items: center; gap: 7px; } .image-panel, .controls-panel, .matrix-panel, .tool-panel { padding: 16px; } .matrix-stage { min-height: 260px; } }
+.mode-switch { display: flex; align-items: center; gap: 6px; margin-right: auto; }
+.mode-switch .button { padding: 9px 12px; font-size: 12px; }
+.mode-label { color: #7a8781; font-size: 12px; margin-right: 4px; }
