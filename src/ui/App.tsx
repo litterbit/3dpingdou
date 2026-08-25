@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ChangeEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   analyzeOccupancy,
   applyThreshold,
@@ -14,199 +14,12 @@ import {
   type Raster,
   type Roi,
 } from "../domain/pixel";
-
-type Step = "upload" | "crop" | "calibrate" | "edit";
-type Tool = "paint" | "erase" | "pick";
-
-interface GridState {
-  roi: Roi;
-  rows: number;
-  columns: number;
-  geometry: GridGeometry;
-  confidence: number;
-}
-
-const STEP_ORDER: Step[] = ["upload", "crop", "calibrate", "edit"];
-const STEP_LABELS = ["01 上传", "02 框选", "03 校准", "04 导出"];
-
-function imageToRaster(image: HTMLImageElement): Raster {
-  const canvas = document.createElement("canvas");
-  canvas.width = image.naturalWidth;
-  canvas.height = image.naturalHeight;
-  const context = canvas.getContext("2d");
-  if (!context) throw new Error("浏览器不支持 Canvas");
-  context.drawImage(image, 0, 0);
-  const data = context.getImageData(0, 0, canvas.width, canvas.height);
-  return { width: canvas.width, height: canvas.height, data: data.data };
-}
-
-function hex(color: readonly number[] | null): string {
-  if (!color) return "#ffffff";
-  return `#${color.map((value) => value.toString(16).padStart(2, "0")).join("")}`;
-}
-
-function parseHex(value: string): [number, number, number] {
-  const clean = value.replace("#", "");
-  return [0, 1, 2].map((index) => Number.parseInt(clean.slice(index * 2, index * 2 + 2), 16)) as [number, number, number];
-}
-
-function titleFor(step: Step): string {
-  if (step === "upload") return "把图纸变成真正的像素图";
-  if (step === "crop") return "框出要转换的拼豆图";
-  if (step === "calibrate") return "校准网格，确认识别";
-  return "检查并导出像素图";
-}
-
-function canvasPoint(event: ReactPointerEvent<HTMLCanvasElement>, raster: Raster): { x: number; y: number } {
-  const bounds = event.currentTarget.getBoundingClientRect();
-  return {
-    x: ((event.clientX - bounds.left) / bounds.width) * raster.width,
-    y: ((event.clientY - bounds.top) / bounds.height) * raster.height,
-  };
-}
-
-function drawRaster(context: CanvasRenderingContext2D, raster: Raster) {
-  context.putImageData(new ImageData(new Uint8ClampedArray(raster.data), raster.width, raster.height), 0, 0);
-}
-
-/** 框选步骤：用户拖出主图区域。 */
-function RoiCanvas({ raster, roi, onChange }: { raster: Raster; roi: Roi | null; onChange: (roi: Roi) => void }) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const dragStart = useRef<{ x: number; y: number } | null>(null);
-  const [draft, setDraft] = useState<Roi | null>(null);
-  const shown = draft ?? roi;
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    const context = canvas?.getContext("2d");
-    if (!canvas || !context) return;
-    canvas.width = raster.width;
-    canvas.height = raster.height;
-    drawRaster(context, raster);
-    if (!shown) return;
-    const x = Math.min(shown.x, shown.x + shown.width);
-    const y = Math.min(shown.y, shown.y + shown.height);
-    const width = Math.abs(shown.width);
-    const height = Math.abs(shown.height);
-    context.fillStyle = "rgba(10, 20, 20, .5)";
-    context.fillRect(0, 0, raster.width, y);
-    context.fillRect(0, y + height, raster.width, raster.height - y - height);
-    context.fillRect(0, y, x, height);
-    context.fillRect(x + width, y, raster.width - x - width, height);
-    context.strokeStyle = "#e76f43";
-    context.lineWidth = Math.max(2, raster.width / 500);
-    context.strokeRect(x, y, width, height);
-  }, [raster, shown]);
-
-  function down(event: ReactPointerEvent<HTMLCanvasElement>) {
-    event.currentTarget.setPointerCapture(event.pointerId);
-    dragStart.current = canvasPoint(event, raster);
-    setDraft({ ...dragStart.current, width: 0, height: 0 });
-  }
-
-  function move(event: ReactPointerEvent<HTMLCanvasElement>) {
-    if (!dragStart.current) return;
-    const point = canvasPoint(event, raster);
-    setDraft({ x: dragStart.current.x, y: dragStart.current.y, width: point.x - dragStart.current.x, height: point.y - dragStart.current.y });
-  }
-
-  function up() {
-    if (draft && Math.abs(draft.width) >= 8 && Math.abs(draft.height) >= 8) {
-      onChange({
-        x: Math.min(draft.x, draft.x + draft.width),
-        y: Math.min(draft.y, draft.y + draft.height),
-        width: Math.abs(draft.width),
-        height: Math.abs(draft.height),
-      });
-    }
-    dragStart.current = null;
-    setDraft(null);
-  }
-
-  return <canvas ref={canvasRef} className="source-canvas" onPointerDown={down} onPointerMove={move} onPointerUp={up} aria-label="拖动框选主图区域" />;
-}
-
-/** 校准步骤：原图 + 网格叠加，支持点击交点对齐。 */
-function GridCanvas({ raster, grid, selectedCell, alignMode, onCellClick, onAlign }: {
-  raster: Raster;
-  grid: GridState;
-  selectedCell: number;
-  alignMode: boolean;
-  onCellClick: (index: number) => void;
-  onAlign: (x: number, y: number) => void;
-}) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    const context = canvas?.getContext("2d");
-    if (!canvas || !context) return;
-    canvas.width = raster.width;
-    canvas.height = raster.height;
-    drawRaster(context, raster);
-    const { geometry, roi, rows, columns } = grid;
-    context.strokeStyle = "rgba(231, 111, 67, .9)";
-    context.lineWidth = Math.max(1.5, raster.width / 700);
-    context.strokeRect(roi.x, roi.y, roi.width, roi.height);
-    context.strokeStyle = "rgba(19, 92, 87, .82)";
-    context.lineWidth = Math.max(1, Math.min(2.5, raster.width / 800));
-    const right = geometry.originX + columns * geometry.cellWidth;
-    const bottom = geometry.originY + rows * geometry.cellHeight;
-    context.beginPath();
-    for (let column = 0; column <= columns; column += 1) {
-      const x = geometry.originX + column * geometry.cellWidth;
-      context.moveTo(x, geometry.originY);
-      context.lineTo(x, bottom);
-    }
-    for (let row = 0; row <= rows; row += 1) {
-      const y = geometry.originY + row * geometry.cellHeight;
-      context.moveTo(geometry.originX, y);
-      context.lineTo(right, y);
-    }
-    context.stroke();
-    if (selectedCell >= 0 && selectedCell < rows * columns) {
-      const row = Math.floor(selectedCell / columns);
-      const column = selectedCell % columns;
-      context.fillStyle = "rgba(221, 101, 55, .3)";
-      context.fillRect(geometry.originX + column * geometry.cellWidth, geometry.originY + row * geometry.cellHeight, geometry.cellWidth, geometry.cellHeight);
-    }
-  }, [raster, grid, selectedCell]);
-
-  function click(event: ReactPointerEvent<HTMLCanvasElement>) {
-    const point = canvasPoint(event, raster);
-    if (alignMode) {
-      onAlign(point.x, point.y);
-      return;
-    }
-    const { geometry, rows, columns } = grid;
-    const column = Math.floor((point.x - geometry.originX) / geometry.cellWidth);
-    const row = Math.floor((point.y - geometry.originY) / geometry.cellHeight);
-    if (row >= 0 && column >= 0 && row < rows && column < columns) onCellClick(row * columns + column);
-  }
-
-  return <canvas ref={canvasRef} onPointerDown={click} className={`source-canvas ${alignMode ? "aligning" : ""}`} aria-label="带网格覆盖的原始图纸" />;
-}
-
-function PixelPreview({ matrix, onCellClick, showGrid = true, labels }: { matrix: PixelMatrix; onCellClick?: (index: number) => void; showGrid?: boolean; labels?: string[] }) {
-  return (
-    <div className={`pixel-preview ${showGrid ? "show-grid" : ""}`} style={{ "--columns": matrix.columns, "--rows": matrix.rows } as React.CSSProperties}>
-      {matrix.cells.map((cell, index) => (
-        <button
-          type="button"
-          key={index}
-          className="pixel-cell"
-          aria-label={`第 ${Math.floor(index / matrix.columns) + 1} 行，第 ${index % matrix.columns + 1} 列`}
-          style={{ backgroundColor: cell.color ? hex(cell.color) : undefined }}
-          onClick={() => onCellClick?.(index)}
-        >{labels?.[index] ? <span className="score">{labels[index]}</span> : null}</button>
-      ))}
-    </div>
-  );
-}
-
-function Field({ label, value, min, max, step = 1, onChange }: { label: string; value: number; min?: number; max?: number; step?: number; onChange: (value: number) => void }) {
-  return <label className="field"><span>{label}</span><input type="number" min={min} max={max} step={step} value={Number.isFinite(value) ? Math.round(value * 100) / 100 : 0} onChange={(event) => onChange(Number(event.target.value))} /></label>;
-}
+import { hex, imageToRaster, parseHex } from "./helpers";
+import { CalibrateStep } from "./steps/CalibrateStep";
+import { CropStep } from "./steps/CropStep";
+import { EditStep } from "./steps/EditStep";
+import { UploadStep } from "./steps/UploadStep";
+import { STEP_LABELS, STEP_ORDER, titleFor, type GridState, type Step, type Tool } from "./types";
 
 export function App() {
   const [step, setStep] = useState<Step>("upload");
@@ -297,16 +110,6 @@ export function App() {
     } catch {
       setError("图片读取失败，请换一张清晰的规则网格图纸。");
     } finally { URL.revokeObjectURL(url); }
-  }
-
-  function upload(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    if (file) void loadFile(file);
-  }
-
-  function confirmRoi() {
-    if (!raster || !roi) return;
-    runDetection(roi);
   }
 
   function runDetection(region: Roi) {
@@ -434,7 +237,7 @@ export function App() {
         <div className="brand-mark">豆</div>
         <div><p className="eyebrow">BEAD PATTERN TOOL</p><h1>拼豆图纸转像素图</h1></div>
         <div className="topbar-actions">
-          <label className="button secondary">打开图片<input hidden type="file" accept="image/png,image/jpeg,image/webp" onChange={upload} /></label>
+          <label className="button secondary">打开图片<input hidden type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => { const file = event.target.files?.[0]; if (file) void loadFile(file); }} /></label>
           {raster && <button className="button secondary" type="button" onClick={reset}>重新开始</button>}
         </div>
       </header>
@@ -446,119 +249,72 @@ export function App() {
 
       {error && <div className="notice error">{error}</div>}
 
-      {step === "upload" && (
-        <section className="upload-zone">
-          <label className="drop-target" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); const file = event.dataTransfer.files[0]; if (file) void loadFile(file); }}>
-            <span className="drop-icon">↑</span><strong>拖入图纸，或点击选择文件</strong><small>支持 PNG、JPG、WebP · 图片只在本地浏览器处理</small>
-            <input type="file" accept="image/png,image/jpeg,image/webp" onChange={upload} />
-          </label>
-          <div className="feature-row"><span>手动框选主图区域</span><span>网格线能量自动定相位</span><span>编号墨迹自动二分类</span><span>透明 PNG 导出</span></div>
-        </section>
-      )}
+      {step === "upload" && <UploadStep onFile={(file) => void loadFile(file)} />}
 
       {step === "crop" && raster && (
-        <section className="panel image-panel">
-          <div className="panel-heading"><div><p className="eyebrow">REGION OF INTEREST</p><h3>框出要转换的拼豆图</h3></div></div>
-          <p className="muted">拖动鼠标框住真正要转换的那张拼豆图，不用特别精确。标题、坐标轴、图例和其他图纸都留在框外。当前区域：{roi ? `${Math.round(roi.width)} × ${Math.round(roi.height)} px` : "未框选"}</p>
-          <div className="canvas-wrap"><RoiCanvas raster={raster} roi={roi} onChange={setRoi} /></div>
-          <div className="action-row">
-            <button type="button" className="button secondary" onClick={() => setRoi(fullRoi(raster))}>使用整张图片</button>
-            <button type="button" className="button primary" disabled={!roi} onClick={confirmRoi}>确认区域，自动检测网格</button>
-          </div>
-        </section>
+        <CropStep
+          raster={raster}
+          roi={roi}
+          onRoiChange={setRoi}
+          onUseFullImage={() => setRoi(fullRoi(raster))}
+          onConfirm={() => { if (roi) runDetection(roi); }}
+        />
       )}
 
       {step === "calibrate" && raster && grid && analysis && occupancyPreview && (
-        <section className="workspace calibrate-layout">
-          <div className="panel image-panel">
-            <div className="panel-heading">
-              <div><p className="eyebrow">OCCUPANCY</p><h3>确认识别结果</h3></div>
-              <span className="metric">网格置信度 {confidence}%</span>
-            </div>
-            <p className="hint-strong">绿色是有豆格，棋盘格是空位，橙色是分数接近阈值的“不确定”格。<strong>点击矩阵中的任意格子可逐格切换有豆/空位</strong>（橙色格点一下即可确认或排除）；打开“显示分数”可查看每格墨迹比例。</p>
-            <div className="binary-stage">
-              <PixelPreview matrix={occupancyPreview} onCellClick={toggleOccupancy} labels={showScores ? analysis.scores.map((score) => score.toFixed(2)) : undefined} />
-            </div>
-            <div className="matrix-caption">
-              <span>有效格 {occupiedCount} 格</span>
-              <label className="toggle"><input type="checkbox" checked={showScores} onChange={(event) => setShowScores(event.target.checked)} /><span>显示分数</span></label>
-              <span className="caption-spacer" />
-              <span>{grid.columns} × {grid.rows}</span>
-            </div>
-            <div className="canvas-wrap source-reference"><GridCanvas raster={raster} grid={grid} selectedCell={selectedCell} alignMode={alignMode} onCellClick={setSelectedCell} onAlign={alignAt} /></div>
-            <p className="muted">核对下方网格线是否精确压在原图格线上。没对齐时点“点击对齐交点”，再点一个真实格线交叉点即可。</p>
-          </div>
-          <div className="panel controls-panel">
-            <div className="panel-heading"><div><p className="eyebrow">GRID</p><h3>网格与阈值</h3></div></div>
-            <p className="muted">自动检测周期约 {grid.geometry.cellWidth.toFixed(2)} × {grid.geometry.cellHeight.toFixed(2)} px。行列数改变时会按框选区域重新均分。</p>
-            <div className="form-grid">
-              <Field label="列数" value={grid.columns} min={1} max={256} onChange={(value) => updateDimensions("columns", value)} />
-              <Field label="行数" value={grid.rows} min={1} max={256} onChange={(value) => updateDimensions("rows", value)} />
-              <Field label="起点 X" value={grid.geometry.originX} step={0.5} onChange={(value) => updateGeometry({ originX: value })} />
-              <Field label="起点 Y" value={grid.geometry.originY} step={0.5} onChange={(value) => updateGeometry({ originY: value })} />
-              <Field label="格宽" value={grid.geometry.cellWidth} min={2} step={0.1} onChange={(value) => updateGeometry({ cellWidth: value })} />
-              <Field label="格高" value={grid.geometry.cellHeight} min={2} step={0.1} onChange={(value) => updateGeometry({ cellHeight: value })} />
-            </div>
-            <div className="form-grid">
-              <Field label="颜色上限" value={maxColors} min={1} max={64} onChange={(value) => setMaxColors(Math.max(1, Math.min(64, Math.round(value) || 1)))} />
-            </div>
-            <p className="muted">拼豆色号通常很少：填充颜色时，相近的采样色会自动合并，最终颜色不会超过这个数量。</p>
-            <label className="field threshold-field">
-              <span>占位阈值（墨迹比例 &gt; {effectiveThreshold.toFixed(3)} 判为有豆，自动值由 Otsu 给出）</span>
-              <input type="range" min={0} max={maxScore} step={maxScore / 200} value={effectiveThreshold} onChange={(event) => setThreshold(Number(event.target.value))} />
-            </label>
-            <div className="action-column">
-              <button type="button" className={`button ${alignMode ? "primary" : "secondary"}`} onClick={() => setAlignMode((value) => !value)}>{alignMode ? "对齐模式已开启：点击一个格线交点" : "点击对齐交点"}</button>
-              <button type="button" className="button secondary" onClick={() => runDetection(grid.roi)}>重新自动检测</button>
-              <button type="button" className="button secondary" onClick={() => setStep("crop")}>返回重新框选</button>
-              <button type="button" className="button primary" onClick={recognize}>确认占位并填充颜色</button>
-            </div>
-          </div>
-        </section>
+        <CalibrateStep
+          raster={raster}
+          grid={grid}
+          analysis={analysis}
+          occupancyPreview={occupancyPreview}
+          confidence={confidence}
+          occupiedCount={occupiedCount}
+          showScores={showScores}
+          onShowScoresChange={setShowScores}
+          onToggleOccupancy={toggleOccupancy}
+          selectedCell={selectedCell}
+          onSelectCell={setSelectedCell}
+          alignMode={alignMode}
+          onToggleAlignMode={() => setAlignMode((value) => !value)}
+          onAlign={alignAt}
+          effectiveThreshold={effectiveThreshold}
+          onThresholdChange={setThreshold}
+          maxScore={maxScore}
+          maxColors={maxColors}
+          onMaxColorsChange={setMaxColors}
+          onUpdateDimensions={updateDimensions}
+          onUpdateGeometry={updateGeometry}
+          onRedetect={() => runDetection(grid.roi)}
+          onBackToCrop={() => setStep("crop")}
+          onRecognize={recognize}
+        />
       )}
 
       {step === "edit" && matrix && (
-        <section className="workspace editor-layout">
-          <div className="panel matrix-panel">
-            <div className="panel-heading">
-              <div><p className="eyebrow">PIXEL MATRIX</p><h3>{matrix.columns} × {matrix.rows} 逻辑像素</h3></div>
-              <label className="toggle"><input type="checkbox" checked={showGrid} onChange={(event) => setShowGrid(event.target.checked)} /><span>网格</span></label>
-            </div>
-            <div className="matrix-stage"><PixelPreview matrix={matrix} showGrid={showGrid} onCellClick={editCell} /></div>
-            <div className="matrix-caption">
-              <span>透明区域</span><span className="checker-chip" />
-              <span>{matrix.cells.filter((cell) => !cell.color).length} 格</span>
-              <span className="caption-spacer" />
-              <button type="button" className="text-button" onClick={() => setStep("calibrate")}>返回校准</button>
-              <span>{palette.length} 种颜色</span>
-            </div>
-          </div>
-          <aside className="panel tool-panel">
-            <div className="panel-heading"><div><p className="eyebrow">TOOLS</p><h3>编辑图案</h3></div></div>
-            <div className="tool-buttons">
-              <button type="button" className={tool === "paint" ? "tool active" : "tool"} onClick={() => setTool("paint")}>画笔</button>
-              <button type="button" className={tool === "erase" ? "tool active" : "tool"} onClick={() => setTool("erase")}>橡皮</button>
-              <button type="button" className={tool === "pick" ? "tool active" : "tool"} onClick={() => setTool("pick")}>吸管</button>
-            </div>
-            <label className="color-picker"><span>当前颜色</span><input type="color" value={paintColor} onChange={(event) => setPaintColor(event.target.value)} /><code>{paintColor.toUpperCase()}</code></label>
-            <div className="palette">
-              <span className="label">图案颜色</span>
-              {palette.map((color) => <button type="button" key={colorKey(color)} className="swatch" style={{ backgroundColor: hex(color) }} aria-label={`选择颜色 ${hex(color)}`} onClick={() => { setPaintColor(hex(color)); setTool("paint"); }} />)}
-            </div>
-            <div className="history-buttons">
-              <button type="button" className="button secondary" disabled={!history.length} onClick={undo}>撤销</button>
-              <button type="button" className="button secondary" disabled={!future.length} onClick={redo}>重做</button>
-            </div>
-            <div className="export-size">
-              <Field label="每格像素" value={exportScale} min={1} max={50} onChange={(value) => setExportScale(Math.max(1, Math.min(50, Math.round(value) || 1)))} />
-              <Field label="悬空块偏移（像素）" value={overlapPx} min={0} max={safeExportScale} onChange={(value) => setOverlapPx(Math.max(0, Math.min(safeExportScale, Math.round(value) || 0)))} />
-              <span className="muted">导出尺寸 {matrix.columns * safeExportScale + safeOverlap * 2} × {matrix.rows * safeExportScale + safeOverlap * 2} px</span>
-              {cornerFix && cornerFix.fixed > 0 && <span className="muted">{cornerFix.fixed} 个仅靠角相连的色块，导出时会朝主体偏移 {safeOverlap} px 产生重叠，打印后即粘在主体上。</span>}
-              {cornerFix && cornerFix.stranded > 0 && <span className="muted">{cornerFix.stranded} 个色块与主体完全分离（连角都不挨着），无法自动粘连，请先用画笔补连。</span>}
-            </div>
-            <button type="button" className="button primary full" onClick={exportPng}>下载透明 PNG</button>
-          </aside>
-        </section>
+        <EditStep
+          matrix={matrix}
+          showGrid={showGrid}
+          onShowGridChange={setShowGrid}
+          onEditCell={editCell}
+          palette={palette}
+          tool={tool}
+          onToolChange={setTool}
+          paintColor={paintColor}
+          onPaintColorChange={setPaintColor}
+          canUndo={history.length > 0}
+          canRedo={future.length > 0}
+          onUndo={undo}
+          onRedo={redo}
+          exportScale={exportScale}
+          onExportScaleChange={setExportScale}
+          overlapPx={overlapPx}
+          onOverlapPxChange={setOverlapPx}
+          safeExportScale={safeExportScale}
+          safeOverlap={safeOverlap}
+          cornerFix={cornerFix}
+          onExport={exportPng}
+          onBackToCalibrate={() => setStep("calibrate")}
+        />
       )}
 
       <footer>图像处理完全在浏览器本地完成 · 不上传原图</footer>
