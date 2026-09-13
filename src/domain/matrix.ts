@@ -1,4 +1,4 @@
-import { clamp, median, rgbAt } from "./helpers";
+import { clamp, colorKey, median, rgbAt } from "./helpers";
 import { analyzeOccupancy } from "./occupancy";
 import { quantizeColors } from "./quantize";
 import type { GridDetection, GridGeometry, PixelMatrix, Raster } from "./types";
@@ -50,4 +50,14 @@ export function recognizeMatrix(raster: Raster, detection: Pick<GridDetection, "
     cells.forEach((cell) => { if (cell.color) { cell.color = quantized[cursor]; cursor += 1; } });
   }
   return { rows: detection.rows, columns: detection.columns, background: [255, 255, 255], cells };
+}
+
+// 把矩阵中所有 from 色格替换为 to 色；无匹配或同色时原样返回，方便调用方跳过历史记录。
+export function replaceMatrixColor(matrix: PixelMatrix, from: [number, number, number], to: [number, number, number]): PixelMatrix {
+  const key = colorKey(from);
+  if (key === colorKey(to) || !matrix.cells.some((cell) => cell.color && colorKey(cell.color) === key)) return matrix;
+  return {
+    ...matrix,
+    cells: matrix.cells.map((cell) => (cell.color && colorKey(cell.color) === key ? { ...cell, color: to } : cell)),
+  };
 }

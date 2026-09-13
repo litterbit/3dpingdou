@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { FloatingBlockOffsets, PixelMatrix } from "../../domain/pixel";
 import { colorKey } from "../../domain/pixel";
 import { Field } from "../Field";
@@ -5,7 +6,7 @@ import { PixelPreview } from "../PixelPreview";
 import { hex } from "../helpers";
 import type { Tool } from "../types";
 
-export function EditStep({ matrix, showGrid, onShowGridChange, onEditCell, palette, tool, onToolChange, paintColor, onPaintColorChange, canUndo, canRedo, onUndo, onRedo, exportScale, onExportScaleChange, overlapPx, onOverlapPxChange, safeExportScale, safeOverlap, cornerFix, onExport, onBackToCalibrate }: {
+export function EditStep({ matrix, showGrid, onShowGridChange, onEditCell, palette, tool, onToolChange, paintColor, onPaintColorChange, onReplaceColor, canUndo, canRedo, onUndo, onRedo, exportScale, onExportScaleChange, overlapPx, onOverlapPxChange, safeExportScale, safeOverlap, cornerFix, onExport, onBackToCalibrate }: {
   matrix: PixelMatrix;
   showGrid: boolean;
   onShowGridChange: (value: boolean) => void;
@@ -15,6 +16,7 @@ export function EditStep({ matrix, showGrid, onShowGridChange, onEditCell, palet
   onToolChange: (tool: Tool) => void;
   paintColor: string;
   onPaintColorChange: (color: string) => void;
+  onReplaceColor: (from: [number, number, number], toHex: string) => void;
   canUndo: boolean;
   canRedo: boolean;
   onUndo: () => void;
@@ -29,6 +31,26 @@ export function EditStep({ matrix, showGrid, onShowGridChange, onEditCell, palet
   onExport: () => void;
   onBackToCalibrate: () => void;
 }) {
+  // 换色模式：点调色板选中要替换的颜色，再用取色器选新颜色，点“应用换色”一次性替换全图。
+  const [replaceMode, setReplaceMode] = useState(false);
+  const [replaceFrom, setReplaceFrom] = useState<[number, number, number] | null>(null);
+  const [replaceTo, setReplaceTo] = useState("#ffffff");
+
+  function toggleReplaceMode() {
+    setReplaceMode((value) => !value);
+    setReplaceFrom(null);
+  }
+
+  function pickSwatch(color: [number, number, number]) {
+    if (replaceMode) {
+      setReplaceFrom(color);
+      setReplaceTo(hex(color));
+    } else {
+      onPaintColorChange(hex(color));
+      onToolChange("paint");
+    }
+  }
+
   return (
     <section className="workspace editor-layout">
       <div className="panel matrix-panel">
@@ -54,9 +76,34 @@ export function EditStep({ matrix, showGrid, onShowGridChange, onEditCell, palet
         </div>
         <label className="color-picker"><span>当前颜色</span><input type="color" value={paintColor} onChange={(event) => onPaintColorChange(event.target.value)} /><code>{paintColor.toUpperCase()}</code></label>
         <div className="palette">
-          <span className="label">图案颜色</span>
-          {palette.map((color) => <button type="button" key={colorKey(color)} className="swatch" style={{ backgroundColor: hex(color) }} aria-label={`选择颜色 ${hex(color)}`} onClick={() => { onPaintColorChange(hex(color)); onToolChange("paint"); }} />)}
+          <div className="palette-head">
+            <span className="label">图案颜色</span>
+            <button type="button" className={replaceMode ? "text-button active" : "text-button"} onClick={toggleReplaceMode}>{replaceMode ? "完成换色" : "换色"}</button>
+          </div>
+          {palette.map((color) => (
+            <button
+              type="button"
+              key={colorKey(color)}
+              className={replaceMode && replaceFrom && colorKey(replaceFrom) === colorKey(color) ? "swatch selected" : "swatch"}
+              style={{ backgroundColor: hex(color) }}
+              aria-label={replaceMode ? `替换颜色 ${hex(color)}` : `选择颜色 ${hex(color)}`}
+              onClick={() => pickSwatch(color)}
+            />
+          ))}
         </div>
+        {replaceMode && (
+          replaceFrom ? (
+            <div className="recolor-bar">
+              <span className="swatch" style={{ backgroundColor: hex(replaceFrom) }} />
+              <span className="muted">→</span>
+              <input type="color" value={replaceTo} onChange={(event) => setReplaceTo(event.target.value)} />
+              <code>{replaceTo.toUpperCase()}</code>
+              <button type="button" className="button secondary" onClick={() => { onReplaceColor(replaceFrom, replaceTo); setReplaceFrom(null); }}>应用换色</button>
+            </div>
+          ) : (
+            <p className="muted">点击上方一个颜色，把它整体换成新颜色。</p>
+          )
+        )}
         <div className="history-buttons">
           <button type="button" className="button secondary" disabled={!canUndo} onClick={onUndo}>撤销</button>
           <button type="button" className="button secondary" disabled={!canRedo} onClick={onRedo}>重做</button>

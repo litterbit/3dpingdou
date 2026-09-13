@@ -9,6 +9,7 @@ import {
   fullRoi,
   recognizeMatrix,
   renderMatrix,
+  replaceMatrixColor,
   floatingBlockOffsets,
   samplePixelMatrix,
   type GridGeometry,
@@ -213,6 +214,17 @@ export function App() {
     setMatrix({ ...matrix, cells: matrix.cells.map((cell, cellIndex) => cellIndex === index ? { ...cell, color } : cell) });
   }
 
+  /** 整体换色：把图上所有 from 色格替换成 to 色，作为一步可撤销的编辑。 */
+  function replaceColor(from: [number, number, number], toHex: string) {
+    if (!matrix) return;
+    const next = replaceMatrixColor(matrix, from, parseHex(toHex));
+    if (next === matrix) return;
+    setHistory((items) => [...items.slice(-29), matrix.cells]);
+    setFuture([]);
+    setMatrix(next);
+    setPaintColor(toHex);
+  }
+
   function editCell(index: number) {
     if (!matrix) return;
     if (tool === "erase") changeCell(index, null);
@@ -341,6 +353,7 @@ export function App() {
           onToolChange={setTool}
           paintColor={paintColor}
           onPaintColorChange={setPaintColor}
+          onReplaceColor={replaceColor}
           canUndo={history.length > 0}
           canRedo={future.length > 0}
           onUndo={undo}
